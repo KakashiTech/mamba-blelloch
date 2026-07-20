@@ -91,7 +91,8 @@ def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None,
                                  delta_softplus,
                                  return_last_state,
                                  None,
-                                 0)
+                                 0,
+                                 None)
 
     if return_last_state:
         out_t, last_state = out_t
@@ -210,32 +211,27 @@ def blelloch_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None, z=None,
     if A_f.dim() == 1:
         A_f = A_f.unsqueeze(-1).expand(-1, dstate)
 
-    # 4. Handle initial_states: prepend an initial step
-    if initial_states is not None:
-        h_init = initial_states.float().permute(0, 1, 3, 2)  # (b, h, dstate, headdim)
-    else:
-        h_init = None
-
-    # 5. Handle seq_idx masking
+    # 4. Handle seq_idx masking
     if seq_idx is not None:
         seq_idx = seq_idx.int()
 
-    # 6. Call blelloch_ssm
+    # 5. Call blelloch_ssm with initial_states
     result = blelloch_ssm(
         x, dt_f.to(x.dtype), A_f, B, C,
         D=D, z=z, delta_bias=None, delta_softplus=False,
         return_last_state=return_final_states or return_varlen_states,
         cu_seqlens=cu_seqlens,
-        checkpoint_lvl=0
+        checkpoint_lvl=0,
+        initial_states=initial_states
     )
 
     if return_final_states or return_varlen_states:
-        out, last_state = result  # last_state: (b, dstate, headdim, nheads) from BlellochSSMFn
-        final_state = last_state.permute(0, 3, 2, 1).contiguous()  # -> (b, nheads, headdim, dstate)
+        out, last_state = result
+        # last_state from BlellochSSMFn: (batch, dstate, headdim, nheads) permuted -> (batch, nheads, headdim, dstate)
+        final_state = last_state.permute(0, 3, 2, 1).contiguous()
         if return_final_states:
             return out, final_state
-        else:
-            return out, final_state.unsqueeze(0)
+        return out, final_state.unsqueeze(0)
     else:
         return (result,)
 

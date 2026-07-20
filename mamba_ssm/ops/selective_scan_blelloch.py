@@ -195,7 +195,8 @@ def ssm_fwd(x, dt, A, B, C, D=None, z=None, delta_bias=None,
 def ssm_bwd(dout, x, dt, A, B, C, D, z, delta_bias,
             delta_softplus=False, scale=None, drive=None,
             B_exp=None, C_exp=None, A_f=None, dt_f=None,
-            is_complex=False, orig_dtype=torch.float32, h=None):
+            is_complex=False, orig_dtype=torch.float32, h=None,
+            initial_states_np=None):
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
 
@@ -263,6 +264,11 @@ def ssm_bwd(dout, x, dt, A, B, C, D, z, delta_bias,
     dscale = torch.einsum("b l h d p, b l h d p -> b l h d", h_adj_stacked, h_prev)
     ddrive = h_adj_stacked
 
+    if initial_states_np is not None:
+        dscale_extra = torch.einsum("b h n p, b h n p -> b h n",
+                                     h_adj_stacked[:, 0], initial_states_np)
+        dscale[:, 0] += dscale_extra
+
     dA_raw = torch.einsum("b l h d, b l h d -> h d", dscale, dt_f.unsqueeze(-1) * scale)
 
     ddt = torch.einsum("b l h d, h d, b l h d -> b l h", dscale, A_f, scale)
@@ -322,7 +328,7 @@ def ssm_bwd(dout, x, dt, A, B, C, D, z, delta_bias,
 class BlellochSSMFn(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, x, dt, A, B, C, D, z, delta_bias, delta_softplus, return_last_state, cu_seqlens, checkpoint_lvl):
+    def forward(ctx, x, dt, A, B, C, D, z, delta_bias, delta_softplus, return_last_state, cu_seqlens, checkpoint_lvl, initial_states=None):
         batch, seqlen, nheads, headdim = x.shape
         _, _, ngroups, dstate = B.shape
 
@@ -349,6 +355,15 @@ class BlellochSSMFn(torch.autograd.Function):
 
         s_bh = rearrange(scale, "b l h d -> (b h) l d")
         d_bh = rearrange(drive, "b l h d p -> (b h) l d p")
+
+        if initial_states is not None:
+            h_init = initial_states.float()
+            h_init_np = h_init.permute(0, 1, 3, 2)  # (B, H, P, N) -> (B, H, N, P)
+            h_init_flat = rearrange(h_init_np, "b h n p -> (b h) n p")
+            d_bh[:, 0] += s_bh[:, 0].unsqueeze(-1) * h_init_flat
+            ctx.initial_states_np = h_init_np
+        else:
+            ctx.initial_states_np = None
 
         h = blelloch_scan_batched(s_bh, d_bh)
         h = rearrange(h, "(b h) l d p -> b l h d p", b=batch, h=nheads)
@@ -419,25 +434,29 @@ class BlellochSSMFn(torch.autograd.Function):
             delta_bias = ctx.saved_tensors[8] if ctx.has_delta_bias else None
             scale = drive = B_exp = C_exp = A_f = dt_f = None
 
-        return ssm_bwd(dout, x, dt, A, B, C, D, z, delta_bias,
-                       ctx.delta_softplus,
-                       scale=scale, drive=drive,
-                       B_exp=B_exp, C_exp=C_exp,
-                       A_f=A_f, dt_f=dt_f,
-                       is_complex=getattr(ctx, 'is_complex', False),
-                       orig_dtype=getattr(ctx, 'orig_dtype', torch.float32),
-                       h=h)
+        grads = ssm_bwd(dout, x, dt, A, B, C, D, z, delta_bias,
+                         ctx.delta_softplus,
+                         scale=scale, drive=drive,
+                         B_exp=B_exp, C_exp=C_exp,
+                         A_f=A_f, dt_f=dt_f,
+                         is_complex=getattr(ctx, 'is_complex', False),
+                         orig_dtype=getattr(ctx, 'orig_dtype', torch.float32),
+                         h=h,
+                         initial_states_np=getattr(ctx, 'initial_states_np', None))
+        return grads + (None,)
 
 
 def blelloch_ssm(x, dt, A, B, C, D=None, z=None, delta_bias=None,
                  delta_softplus=False, return_last_state=False,
-                 cu_seqlens=None, checkpoint_lvl=0):
+                 cu_seqlens=None, checkpoint_lvl=0, initial_states=None):
     return BlellochSSMFn.apply(x, dt, A, B, C, D, z, delta_bias, delta_softplus,
-                                return_last_state, cu_seqlens, checkpoint_lvl)
+                                return_last_state, cu_seqlens, checkpoint_lvl,
+                                initial_states)
 
 
 def ref_ssm_scan(x, dt, A, B, C, D=None, z=None, delta_bias=None,
-                 delta_softplus=False, return_last_state=False):
+                 delta_softplus=False, return_last_state=False,
+                 initial_states=None):
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
     nheads_ratio = nheads // ngroups
@@ -454,7 +473,10 @@ def ref_ssm_scan(x, dt, A, B, C, D=None, z=None, delta_bias=None,
     A_f = A.float()
     scale = torch.exp(dt_f.unsqueeze(-1) * A_f.unsqueeze(0).unsqueeze(1))
 
-    h = torch.zeros(batch, nheads, dstate, headdim, device=x.device, dtype=torch.float32)
+    if initial_states is not None:
+        h = initial_states.float().permute(0, 1, 3, 2).clone()  # (b, h, P, N) -> (b, h, N, P)
+    else:
+        h = torch.zeros(batch, nheads, dstate, headdim, device=x.device, dtype=torch.float32)
     ys = []
     for t in range(seqlen):
         drive = (dt_f[:, t, :].unsqueeze(-1).unsqueeze(-1) *
