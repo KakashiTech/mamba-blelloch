@@ -322,9 +322,7 @@ def ssm_bwd(dout, x, dt, A, B, C, D, z, delta_bias,
 class BlellochSSMFn(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, x, dt, A, B, C, D=None, z=None, delta_bias=None,
-                delta_softplus=False, return_last_state=False,
-                cu_seqlens=None, checkpoint_lvl=0):
+    def forward(ctx, x, dt, A, B, C, D, z, delta_bias, delta_softplus, return_last_state, cu_seqlens, checkpoint_lvl):
         batch, seqlen, nheads, headdim = x.shape
         _, _, ngroups, dstate = B.shape
 
