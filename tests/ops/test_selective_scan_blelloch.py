@@ -1,9 +1,6 @@
-"""Tests for Blelloch prefix scan integration with Mamba2 SSD API.
-
-Compares blelloch_chunk_scan_combined against:
-  1. blelloch_chunk_scan_combined_ref (pure-Python reference)
-  2. mamba_chunk_scan_combined (Triton, if CUDA available)
-"""
+# Copyright (c) 2024, Tri Dao, Albert Gu.
+# Copyright (c) 2025, KakashiTech.
+# Tests for the Blelloch prefix scan integration for Mamba2 SSD.
 
 import torch
 import torch.nn.functional as F
