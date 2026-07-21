@@ -78,7 +78,7 @@ def _down_sweep_kernel(
     prefix_d = tl.load(d_ptr + off_r + h * stride_d_headdim)
 
     tl.store(d_ptr + off_l + h * stride_d_headdim, prefix_d)
-    tl.store(d_ptr + off_r + h * stride_d_headdim, prefix_s * d_left_old + prefix_d)
+    tl.store(d_ptr + off_r + h * stride_d_headdim, s_left_old * prefix_d + d_left_old)
     tl.store(s_ptr + base_s + left_idx * stride_s_seq, prefix_s)
     tl.store(s_ptr + base_s + right_idx * stride_s_seq, s_left_old * prefix_s)
 
