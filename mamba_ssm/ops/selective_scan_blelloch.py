@@ -115,7 +115,8 @@ def _complex_to_real(A):
 
 def ssm_fwd(x, dt, A, B, C, D=None, z=None, delta_bias=None,
             delta_softplus=False, return_last_state=False,
-            cu_seqlens=None, checkpoint_lvl=0):
+            cu_seqlens=None, checkpoint_lvl=0,
+            seq_idx=None, state_dtype=None):
     if cu_seqlens is not None:
         orig_batch = len(cu_seqlens) - 1
         batch = orig_batch
@@ -154,10 +155,25 @@ def ssm_fwd(x, dt, A, B, C, D=None, z=None, delta_bias=None,
     s_bh = rearrange(scale, "b l h d -> (b h) l d")
     d_bh = rearrange(drive, "b l h d p -> (b h) l d p")
 
+    if seq_idx is not None:
+        seq_reset = F.pad(
+            seq_idx[:, 1:] != seq_idx[:, :-1], (1, 0), value=False
+        )  # (B, L)
+        seq_reset_exp = repeat(seq_reset, "b l -> (b h) l", h=nheads)
+        s_bh = s_bh.clone()
+        s_bh[seq_reset_exp] = 0.0
+
     h = blelloch_scan_batched(s_bh, d_bh)
     h = rearrange(h, "(b h) l d p -> b l h d p", b=batch, h=nheads)
 
-    y = torch.einsum("b l h d p, b l h d -> b l h p", h, C_exp)
+    if state_dtype is not None:
+        h_einsum = h.to(state_dtype)
+        C_exp_einsum = C_exp.to(state_dtype)
+    else:
+        h_einsum = h
+        C_exp_einsum = C_exp
+
+    y = torch.einsum("b l h d p, b l h d -> b l h p", h_einsum, C_exp_einsum)
 
     if D is not None:
         D_f = D.float()
@@ -196,28 +212,32 @@ def ssm_bwd(dout, x, dt, A, B, C, D, z, delta_bias,
             delta_softplus=False, scale=None, drive=None,
             B_exp=None, C_exp=None, A_f=None, dt_f=None,
             is_complex=False, orig_dtype=torch.float32, h=None,
-            initial_states_np=None):
+            initial_states_np=None, seq_reset=None):
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
+    work_dtype = orig_dtype if orig_dtype == torch.float64 else torch.float32
+
+    def _to(x, t=work_dtype):
+        return x.to(t) if x is not None else None
 
     if dt_f is None or A_f is None or B_exp is None or C_exp is None:
-        x_f = x.float().detach()
-        dt_f = dt.float().detach()
+        x_f = _to(x).detach()
+        dt_f = _to(dt).detach()
         if delta_bias is not None:
-            dt_f = dt_f + delta_bias.float().unsqueeze(0).unsqueeze(1)
+            dt_f = dt_f + _to(delta_bias).unsqueeze(0).unsqueeze(1)
         if delta_softplus:
             dt_f = F.softplus(dt_f)
         if is_complex:
-            A_f = _complex_to_real(A).float().detach()
+            A_f = _to(_complex_to_real(A)).detach()
         else:
-            A_f = A.float().detach()
+            A_f = _to(A).detach()
         if A_f.dim() == 1:
             A_f = A_f.unsqueeze(-1).expand(-1, dstate)
-        B_exp, C_exp = _expand_bc(B, C, nheads)
+        B_exp, C_exp = _expand_bc(B, C, nheads, dtype=work_dtype)
         scale = torch.exp(dt_f.unsqueeze(-1) * A_f.unsqueeze(0).unsqueeze(1))
         drive = dt_f.unsqueeze(-1).unsqueeze(-1) * B_exp.unsqueeze(-1) * x_f.unsqueeze(-2)
     else:
-        x_f = x.float().detach()
+        x_f = _to(x).detach()
         dt_f = dt_f.detach()
         A_f = A_f.detach()
         B_exp = B_exp.detach()
@@ -227,24 +247,31 @@ def ssm_bwd(dout, x, dt, A, B, C, D, z, delta_bias,
 
     s_exp = scale.unsqueeze(-1)
 
+    if seq_reset is not None:
+        seq_mask_exp = repeat(
+            (~seq_reset).to(work_dtype),
+            "b l -> b l h d 1", h=nheads, d=dstate
+        )
+        s_exp = s_exp * seq_mask_exp
+
     if z is not None:
-        z_f = z.float().detach()
+        z_f = _to(z).detach()
         if z_f.dim() == 3:
             z_f = z_f.unsqueeze(-1)
-        dout_f = dout.float() * F.silu(z_f)
+        dout_f = _to(dout) * F.silu(z_f)
     else:
         z_f = None
-        dout_f = dout.float()
+        dout_f = _to(dout)
 
     if h is not None:
-        h = h.float().detach()
+        h = _to(h).detach()
     else:
         s_bh = rearrange(scale, "b l h d -> (b h) l d")
         d_bh = rearrange(drive, "b l h d p -> (b h) l d p")
         h = blelloch_scan_batched(s_bh, d_bh)
         h = rearrange(h, "(b h) l d p -> b l h d p", b=batch, h=nheads)
 
-    h_adj = torch.zeros(batch, nheads, dstate, headdim, device=x.device, dtype=torch.float32)
+    h_adj = torch.zeros(batch, nheads, dstate, headdim, device=x.device, dtype=work_dtype)
     h_adj_list = []
     for t in reversed(range(seqlen)):
         dout_y = torch.einsum("b h p, b h d -> b h d p", dout_f[:, t], C_exp[:, t])
@@ -257,9 +284,13 @@ def ssm_bwd(dout, x, dt, A, B, C, D, z, delta_bias,
     h_adj_stacked = torch.cat(h_adj_list, dim=1)
 
     h_prev = torch.cat([
-        torch.zeros(batch, 1, nheads, dstate, headdim, device=x.device, dtype=torch.float32),
+        torch.zeros(batch, 1, nheads, dstate, headdim, device=x.device, dtype=work_dtype),
         h[:, :-1]
     ], dim=1)
+
+    if seq_reset is not None:
+        seq_reset_exp = repeat(seq_reset, "b l -> b l 1 1 1")
+        h_prev = h_prev * (~seq_reset_exp).to(work_dtype)
 
     dscale = torch.einsum("b l h d p, b l h d p -> b l h d", h_adj_stacked, h_prev)
     ddrive = h_adj_stacked
@@ -279,7 +310,7 @@ def ssm_bwd(dout, x, dt, A, B, C, D, z, delta_bias,
     dC = torch.einsum("b l h p, b l h d p -> b l h d", dout_f, h)
 
     if D is not None:
-        D_f = D.float().detach()
+        D_f = _to(D).detach()
         if D_f.dim() == 1:
             D_f = D_f.unsqueeze(-1)
         dD = (dout_f * x_f).sum(dim=(0, 1))
@@ -293,7 +324,7 @@ def ssm_bwd(dout, x, dt, A, B, C, D, z, delta_bias,
         if D is not None:
             y_ssm = y_ssm + x_f * D_f.unsqueeze(0).unsqueeze(1)
         silu_deriv = torch.sigmoid(z_f) * (1 + z_f * (1 - torch.sigmoid(z_f)))
-        dz = dout.float() * y_ssm * silu_deriv
+        dz = _to(dout) * y_ssm * silu_deriv
         if dz.dim() == 4 and z.dim() == 3:
             dz = dz.squeeze(-1)
     else:
@@ -308,10 +339,10 @@ def ssm_bwd(dout, x, dt, A, B, C, D, z, delta_bias,
         else:
             dA_out = dA_raw.to(A.dtype)
 
-    dB_red, dC_red = _reduce_bc(dB, dC, ngroups, nheads, torch.float32)
+    dB_red, dC_red = _reduce_bc(dB, dC, ngroups, nheads, work_dtype)
 
     if delta_softplus:
-        sp_in = dt.float() + (delta_bias.float().unsqueeze(0).unsqueeze(1) if delta_bias is not None else 0)
+        sp_in = _to(dt) + (_to(delta_bias).unsqueeze(0).unsqueeze(1) if delta_bias is not None else 0)
         sp_deriv = torch.sigmoid(sp_in)
         ddt = ddt * sp_deriv
         ddelta_bias = ddt.sum(dim=(0, 1)) if delta_bias is not None else None
@@ -328,7 +359,7 @@ def ssm_bwd(dout, x, dt, A, B, C, D, z, delta_bias,
 class BlellochSSMFn(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, x, dt, A, B, C, D, z, delta_bias, delta_softplus, return_last_state, cu_seqlens, checkpoint_lvl, initial_states=None):
+    def forward(ctx, x, dt, A, B, C, D, z, delta_bias, delta_softplus, return_last_state, cu_seqlens, checkpoint_lvl, initial_states=None, seq_idx=None, state_dtype=None, return_h=False):
         batch, seqlen, nheads, headdim = x.shape
         _, _, ngroups, dstate = B.shape
 
@@ -356,9 +387,21 @@ class BlellochSSMFn(torch.autograd.Function):
         s_bh = rearrange(scale, "b l h d -> (b h) l d")
         d_bh = rearrange(drive, "b l h d p -> (b h) l d p")
 
+        if seq_idx is not None:
+            seq_idx_i = seq_idx.int()
+            seq_reset = F.pad(
+                seq_idx_i[:, 1:] != seq_idx_i[:, :-1], (1, 0), value=False
+            )  # (B, L)
+            seq_reset_exp = repeat(seq_reset, "b l -> (b h) l", h=nheads)
+            s_bh = s_bh.clone()
+            s_bh[seq_reset_exp] = 0.0
+            ctx.seq_reset = seq_reset
+        else:
+            ctx.seq_reset = None
+
         if initial_states is not None:
             h_init = initial_states.float()
-            h_init_np = h_init.permute(0, 1, 3, 2)  # (B, H, P, N) -> (B, H, N, P)
+            h_init_np = h_init.permute(0, 1, 3, 2)
             h_init_flat = rearrange(h_init_np, "b h n p -> (b h) n p")
             d_bh[:, 0] += s_bh[:, 0].unsqueeze(-1) * h_init_flat
             ctx.initial_states_np = h_init_np
@@ -368,7 +411,14 @@ class BlellochSSMFn(torch.autograd.Function):
         h = blelloch_scan_batched(s_bh, d_bh)
         h = rearrange(h, "(b h) l d p -> b l h d p", b=batch, h=nheads)
 
-        y = torch.einsum("b l h d p, b l h d -> b l h p", h, C_exp)
+        if state_dtype is not None:
+            h_einsum = h.to(state_dtype)
+            C_exp_einsum = C_exp.to(state_dtype)
+        else:
+            h_einsum = h
+            C_exp_einsum = C_exp
+
+        y = torch.einsum("b l h d p, b l h d -> b l h p", h_einsum, C_exp_einsum)
 
         if D is not None:
             D_f = D.float()
@@ -414,7 +464,15 @@ class BlellochSSMFn(torch.autograd.Function):
         if return_last_state:
             last_state = h[:, -1].permute(0, 2, 3, 1).to(orig_dtype)
             ctx.mark_non_differentiable(last_state)
+            if return_h:
+                h_out = h.detach().permute(0, 1, 2, 4, 3).contiguous()
+                ctx.mark_non_differentiable(h_out)
+                return out, last_state, h_out
             return out, last_state
+        if return_h:
+            h_out = h.detach().permute(0, 1, 2, 4, 3).contiguous()
+            ctx.mark_non_differentiable(h_out)
+            return out, h_out
         return out
 
     @staticmethod
@@ -442,16 +500,18 @@ class BlellochSSMFn(torch.autograd.Function):
                          is_complex=getattr(ctx, 'is_complex', False),
                          orig_dtype=getattr(ctx, 'orig_dtype', torch.float32),
                          h=h,
-                         initial_states_np=getattr(ctx, 'initial_states_np', None))
-        return grads + (None,)
+                         initial_states_np=getattr(ctx, 'initial_states_np', None),
+                         seq_reset=getattr(ctx, 'seq_reset', None))
+        return grads + (None, None, None, None)
 
 
 def blelloch_ssm(x, dt, A, B, C, D=None, z=None, delta_bias=None,
                  delta_softplus=False, return_last_state=False,
-                 cu_seqlens=None, checkpoint_lvl=0, initial_states=None):
+                 cu_seqlens=None, checkpoint_lvl=0, initial_states=None,
+                 seq_idx=None, state_dtype=None, return_h=False):
     return BlellochSSMFn.apply(x, dt, A, B, C, D, z, delta_bias, delta_softplus,
                                 return_last_state, cu_seqlens, checkpoint_lvl,
-                                initial_states)
+                                initial_states, seq_idx, state_dtype, return_h)
 
 
 def ref_ssm_scan(x, dt, A, B, C, D=None, z=None, delta_bias=None,
@@ -554,7 +614,7 @@ def test_blelloch():
         grads_ref[k] = locals()[k].grad.clone()
         locals()[k].grad.zero_()
 
-    blel_out = BlellochSSMFn.apply(x, dt, A, B, C, D, z, delta_bias, True)
+    blel_out = BlellochSSMFn.apply(x, dt, A, B, C, D, z, delta_bias, True, None, 0, None, None, None)
     blel_loss = blel_out.pow(2).sum()
     blel_loss.backward()
 

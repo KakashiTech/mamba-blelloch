@@ -216,21 +216,48 @@ def blelloch_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None, z=None,
         seq_idx = seq_idx.int()
 
     # 5. Call blelloch_ssm with initial_states
+    need_h = return_varlen_states and seq_idx is not None
     result = blelloch_ssm(
         x, dt_f.to(x.dtype), A_f, B, C,
         D=D, z=z, delta_bias=None, delta_softplus=False,
         return_last_state=return_final_states or return_varlen_states,
         cu_seqlens=cu_seqlens,
         checkpoint_lvl=0,
-        initial_states=initial_states
+        initial_states=initial_states,
+        seq_idx=seq_idx,
+        state_dtype=state_dtype,
+        return_h=need_h,
     )
 
     if return_final_states or return_varlen_states:
-        out, last_state = result
-        # last_state from BlellochSSMFn: (batch, dstate, headdim, nheads) permuted -> (batch, nheads, headdim, dstate)
+        if need_h:
+            out, last_state, h_states = result
+        else:
+            out, last_state = result
+            h_states = None
         final_state = last_state.permute(0, 3, 2, 1).contiguous()
         if return_final_states:
             return out, final_state
+        if seq_idx is not None:
+            seq_end = torch.cat([
+                seq_idx[:, 1:] != seq_idx[:, :-1],
+                torch.ones(batch, 1, dtype=torch.bool, device=seq_idx.device)
+            ], dim=1)
+            n_segments = seq_idx.max().item() + 1
+            max_n = n_segments
+            states = torch.zeros(max_n, batch, nheads, headdim, dstate,
+                                 device=x.device, dtype=final_state.dtype)
+            for i in range(max_n):
+                mask = (seq_idx == i) & seq_end
+                for b in range(batch):
+                    pos = mask[b].nonzero()
+                    if len(pos) > 0:
+                        t = pos[-1].item()
+                        if h_states is not None:
+                            states[i, b] = h_states[b, t]
+                        else:
+                            states[i, b] = final_state[b]
+            return out, states
         return out, final_state.unsqueeze(0)
     else:
         return (result,)
