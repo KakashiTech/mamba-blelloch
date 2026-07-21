@@ -31,6 +31,11 @@ from mamba_ssm.distributed.distributed_utils import all_reduce, reduce_scatter
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 
+try:
+    from mamba_ssm.ops.selective_scan_blelloch_interface import blelloch_chunk_scan_combined
+except ImportError:
+    blelloch_chunk_scan_combined = None
+
 from huggingface_hub import PyTorchModelHubMixin
 
 
@@ -58,6 +63,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         # Fused kernel and sharding options
         chunk_size=256,
         use_mem_eff_path=True,
+        scan_impl="triton",  # "triton" (chunked SSD) or "blelloch" (exact Blelloch prefix scan)
         layer_idx=None,  # Absorb kwarg for general module
         process_group=None,
         sequence_parallel=True,
@@ -90,6 +96,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.activation = "silu"
         self.chunk_size = chunk_size
         self.use_mem_eff_path = use_mem_eff_path
+        self.scan_impl = scan_impl
         self.layer_idx = layer_idx
 
         # Order: [z, x, B, C, dt]
@@ -181,7 +188,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
-        if self.use_mem_eff_path and inference_params is None:
+        use_blelloch = self.scan_impl == "blelloch" and blelloch_chunk_scan_combined is not None
+        if self.use_mem_eff_path and inference_params is None and not use_blelloch:
             out = mamba_split_conv1d_scan_combined(
                 zxbcdt,
                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
@@ -241,7 +249,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                     seq_idx=seq_idx,
                 ).transpose(1, 2)
             x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
-            y = mamba_chunk_scan_combined(
+            scan_fn = blelloch_chunk_scan_combined if use_blelloch else mamba_chunk_scan_combined
+            scan_result = scan_fn(
                 rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
                 dt,
                 A,
@@ -259,12 +268,20 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 return_varlen_states=cu_seqlens is not None and inference_params is not None,
             )
             if ssm_state is not None:
-                y, last_state, *rest = y
+                if use_blelloch:
+                    y, last_state, *rest = scan_result
+                else:
+                    y, last_state, *rest = scan_result
                 if cu_seqlens is None:
                     ssm_state.copy_(last_state)
                 else:
                     varlen_states = rest[0]
                     ssm_state.copy_(varlen_states)
+            else:
+                if isinstance(scan_result, tuple):
+                    y = scan_result[0]
+                else:
+                    y = scan_result
             y = rearrange(y, "b l h p -> b l (h p)")
             if self.rmsnorm:
                 y = self.norm(y, z)
